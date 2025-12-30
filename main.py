@@ -10,7 +10,7 @@ import httpx
 app = FastAPI()
 
 HMAC_SECRET = os.environ.get("HMAC_SECRET", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 
