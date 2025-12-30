@@ -1,163 +1,225 @@
 import os
+import json
 import time
 import hmac
 import hashlib
-import json
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+import re
+from typing import Optional, Dict, Any
+
 import httpx
+from fastapi import FastAPI, HTTPException, Request, Depends
+from pydantic import BaseModel, Field
 
-app = FastAPI()
+app = FastAPI(title="Neutral News Rewrite API")
 
+# ---- ENV ----
+# Поддерживаем оба имени переменной, чтобы не ловить 500 из-за одной буквы.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("API_KEY") or ""
 HMAC_SECRET = os.environ.get("HMAC_SECRET", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_ENDPOINT = os.environ.get("GEMINI_ENDPOINT", "https://generativelanguage.googleapis.com/v1beta")
 
-
-def _need_env(name: str, val: str):
+def _need_env(name: str, val: str) -> str:
     if not val:
-        raise HTTPException(500, f"{name} is not set")
+        raise HTTPException(status_code=500, detail=f"Missing required env: {name}")
+    return val
 
+# ---- HMAC ----
+def verify_hmac(req: Request) -> None:
+    secret = _need_env("HMAC_SECRET", HMAC_SECRET).encode()
 
-def _no_store_headers():
-    # чтобы проверки здоровья не кэшировались где-нибудь по пути
-    return {"Cache-Control": "no-store, max-age=0"}
-
-
-def verify_hmac(raw_body: bytes, ts: str, sig: str):
-    _need_env("HMAC_SECRET", HMAC_SECRET)
-
+    ts = req.headers.get("X-Timestamp", "")
+    sig = req.headers.get("X-Signature", "")
     if not ts or not sig:
-        raise HTTPException(401, "Missing signature headers")
+        raise HTTPException(status_code=401, detail="Missing signature headers")
 
+    # защита от повторов/задержек
     try:
-        t = int(ts)
-    except Exception:
-        raise HTTPException(401, "Bad timestamp")
+        ts_int = int(ts)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid timestamp")
 
-    # 5-minute window
-    if abs(int(time.time()) - t) > 300:
-        raise HTTPException(401, "Stale request")
+    now = int(time.time())
+    if abs(now - ts_int) > 300:
+        raise HTTPException(status_code=401, detail="Timestamp out of window")
 
-    msg = ts.encode("utf-8") + b"." + raw_body
-    expected = hmac.new(HMAC_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-
+    raw_body = getattr(req.state, "raw_body", b"")
+    msg = ts.encode() + b"." + raw_body
+    expected = hmac.new(secret, msg, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, sig):
-        raise HTTPException(401, "Bad signature")
+        raise HTTPException(status_code=401, detail="Bad signature")
 
+# ---- Input/Output ----
+class RewriteRequest(BaseModel):
+    source_title: str = Field(default="")
+    source_text: str = Field(...)
+    source_url: Optional[str] = Field(default="")
+    source_site: Optional[str] = Field(default="")
+    source_published_at: Optional[str] = Field(default="")
+    source_image: Optional[str] = Field(default="")
+    region_hint: Optional[str] = Field(default="")
+
+class RewriteResponse(BaseModel):
+    title: str
+    text: str
+    summary: str
+    tags: list[str]
+    category: str
+    image_prompt: str
+
+# ---- Prompt ----
+def build_prompt(payload: RewriteRequest) -> str:
+    # Важно: требуем "только JSON", без обёрток и пояснений.
+    return f"""Ты редактор новостного сайта. Задача: переписать новость нейтрально, без выдумок, сохраняя факты.
+Язык: русский.
+
+Жёсткие правила:
+1) НИЧЕГО не добавляй от себя. Если в тексте нет факта — не придумывай.
+2) Не упоминай исходный источник, не пиши "по данным" и т.п., если этого нет в тексте.
+3) Не используй оценочные суждения и эмоции. Никакой агитации.
+4) Не меняй смысл. Исправляй стиль, структуру, ясность.
+5) Не вставляй ссылки, если их нет в исходных данных.
+6) Верни результат СТРОГО в виде JSON-объекта без лишнего текста, без Markdown, без ```.
+
+Входные данные:
+Заголовок: {payload.source_title}
+Регион (подсказка): {payload.region_hint}
+Дата/время (если есть): {payload.source_published_at}
+Текст: {payload.source_text}
+
+Требуемый JSON (строго эти ключи):
+{{
+  "title": "короткий заголовок 60–90 знаков",
+  "text": "полный текст новости 900–1800 знаков, абзацы разделяй \n\n",
+  "summary": "1–2 предложения 200–350 знаков",
+  "tags": ["3–8 коротких тегов, без решёток"],
+  "category": "одна категория: Город|Происшествия|Политика|Экономика|Культура|Спорт|Общество|Транспорт|Недвижимость|Погода|Другое",
+  "image_prompt": "краткое описание изображения без текста на картинке, фотореализм"
+}}
+"""
+
+# ---- JSON extraction fallback ----
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+
+def _parse_json_strict_or_fallback(text: str) -> Dict[str, Any]:
+    """Пытаемся распарсить JSON максимально строго, но если модель всё же добавила мусор — вытащим JSON из текста."""
+    s = text.strip()
+
+    # Частый случай: модель обернула в ```json ... ```
+    m = _JSON_FENCE_RE.search(s)
+    if m:
+        s = m.group(1).strip()
+
+    # 1) строго
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # 2) вытащить первый объект {...} или массив [...]
+    obj_start = s.find("{")
+    obj_end = s.rfind("}")
+    arr_start = s.find("[")
+    arr_end = s.rfind("]")
+
+    candidates = []
+    if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+        candidates.append(s[obj_start:obj_end+1])
+    if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+        candidates.append(s[arr_start:arr_end+1])
+
+    for c in candidates:
+        try:
+            return json.loads(c)
+        except Exception:
+            continue
+
+    raise HTTPException(status_code=502, detail="Model returned non-JSON")
+
+# ---- Gemini call ----
+async def call_gemini(prompt: str) -> Dict[str, Any]:
+    api_key = _need_env("GEMINI_API_KEY (or API_KEY)", GEMINI_API_KEY)
+    model = GEMINI_MODEL.strip()
+    # На всякий случай убираем лишний префикс, если кто-то вписал "models/..."
+    model = model.replace("models/", "")
+
+    url = f"{GEMINI_ENDPOINT}/models/{model}:generateContent?key={api_key}"
+
+    # JSON Mode: просим JSON и задаём схему.
+    # Даже если конкретная версия API проигнорирует эти поля, у нас есть строгий промт + запасной парсер.
+    generation_config = {
+        "temperature": 0.2,
+        "maxOutputTokens": 2200,
+        "responseMimeType": "application/json",
+        "responseSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "text": {"type": "string"},
+                "summary": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "category": {"type": "string"},
+                "image_prompt": {"type": "string"},
+            },
+            "required": ["title", "text", "summary", "tags", "category", "image_prompt"],
+        },
+    }
+
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": generation_config,
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, json=body)
+        # Ошибки модели/ключа — отдаём явно.
+        if r.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Gemini error: {r.status_code}: {r.text[:500]}")
+
+        data = r.json()
+        try:
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            raise HTTPException(status_code=502, detail="Unexpected Gemini response structure")
+
+        parsed = _parse_json_strict_or_fallback(text)
+
+    # Нормализация типов
+    if not isinstance(parsed.get("tags", []), list):
+        parsed["tags"] = []
+
+    return parsed
+
+# ---- Middleware: keep raw body for signature ----
+@app.middleware("http")
+async def capture_raw_body(request: Request, call_next):
+    request.state.raw_body = await request.body()
+    return await call_next(request)
 
 @app.get("/")
 def root():
-    return JSONResponse(
-        {
-            "ok": True,
-            "routes": {
-                "health": "GET /healthz (and /health, /_health, /ping)",
-                "rewrite": "POST /rewrite (HMAC required)",
-                "rewrite_alias": "POST / (HMAC required)",
-            },
-        },
-        headers=_no_store_headers(),
-    )
+    return {"ok": True, "routes": {"health": "GET /healthz", "rewrite": "POST /rewrite (HMAC required)", "rewrite_alias": "POST / (HMAC required)"}}
 
-
-# Несколько health-эндпоинтов: выбирайте любой в админке
 @app.get("/healthz")
-@app.get("/health")
-@app.get("/_health")
-@app.get("/ping")
-def health():
-    return JSONResponse({"ok": True}, headers=_no_store_headers())
+def healthz():
+    return {"ok": True}
 
-
-def build_prompt(payload: dict) -> str:
-    return f"""\
-Ты — редактор новостей. Переформулируй материал нейтрально.
-НЕЛЬЗЯ добавлять факты, которых нет в исходном тексте.
-НЕЛЬЗЯ копировать исходник длинными кусками. Нужен полный перефраз.
-Выводи ТОЛЬКО валидный JSON без Markdown и без комментариев.
-
-Вход:
-source_title: {payload.get("source_title","")}
-source_text: {payload.get("source_text","")}
-source_url: {payload.get("source_url","")}
-source_site: {payload.get("source_site","")}
-source_published_at: {payload.get("source_published_at","")}
-source_image: {payload.get("source_image","")}
-region_hint: {payload.get("region_hint","")}
-
-Верни строго JSON такого вида:
-{{
-  "ok": true,
-  "confidence": 0.0,
-  "flags": [],
-  "newsItem": {{
-    "id": "ai-xxxxxxxxxxxx",
-    "slug": "kebab-case-xxxx",
-    "title": "",
-    "excerpt": "",
-    "content": [
-      {{ "type":"paragraph", "value":"" }}
-    ],
-    "category": {{ "slug":"city", "title":"Город" }},
-    "tags": [],
-    "author": {{ "name":"Редакция", "role":"Новости" }},
-    "publishedAt": "",
-    "heroImage": "",
-    "readingTime": 1
-  }}
-}}
-
-Правила:
-- Не выдумывай факты. Если чего-то нет — "не уточняется".
-- category.slug только из: city, transport, incidents, sports, events, real-estate.
-- heroImage: если source_image пустой — ставь "".
-- В content сделай 3–6 абзацев (paragraph). Список (list) — только если уместно.
-""".strip()
-
-
-async def call_gemini(prompt: str) -> dict:
-    _need_env("GEMINI_API_KEY", GEMINI_API_KEY)
-
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1800},
-    }
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, json=body)
-        if r.status_code >= 400:
-            raise HTTPException(502, f"Gemini error: {r.status_code} {r.text[:200]}")
-
-        data = r.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-
-        try:
-            return json.loads(text)
-        except Exception:
-            raise HTTPException(502, "Model returned non-JSON")
-
-
-@app.post("/rewrite")
-async def rewrite(req: Request):
-    raw = await req.body()
-    verify_hmac(raw, req.headers.get("X-Timestamp", ""), req.headers.get("X-Signature", ""))
-
-    payload = await req.json()
+@app.post("/rewrite", response_model=RewriteResponse)
+async def rewrite(payload: RewriteRequest, req: Request, _=Depends(verify_hmac)):
     prompt = build_prompt(payload)
     out = await call_gemini(prompt)
 
-    if not isinstance(out, dict) or out.get("ok") is not True:
-        raise HTTPException(502, "Bad output format")
+    # Подстраховка: если модель вернула лишние ключи — игнорируем.
+    return RewriteResponse(
+        title=str(out.get("title", "")).strip(),
+        text=str(out.get("text", "")).strip(),
+        summary=str(out.get("summary", "")).strip(),
+        tags=[str(t).strip() for t in (out.get("tags") or []) if str(t).strip()],
+        category=str(out.get("category", "Другое")).strip() or "Другое",
+        image_prompt=str(out.get("image_prompt", "")).strip(),
+    )
 
-    return JSONResponse(out)
-
-
-# Алиас: если кто-то бьёт POST /
-@app.post("/")
-async def rewrite_alias(req: Request):
-    return await rewrite(req)
+# Алиас: POST /
+@app.post("/", response_model=RewriteResponse)
+async def rewrite_alias(payload: RewriteRequest, req: Request, _=Depends(verify_hmac)):
+    return await rewrite(payload, req)

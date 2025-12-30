@@ -2,7 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.log
 .env
-.git
-node_modules/
+.venv
+venv/
 dist/
+build/
+*.zip
