@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import json
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 import httpx
 
 app = FastAPI()
@@ -12,12 +13,20 @@ HMAC_SECRET = os.environ.get("HMAC_SECRET", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-pro")
 
+
 def _need_env(name: str, val: str):
     if not val:
         raise HTTPException(500, f"{name} is not set")
 
+
+def _no_store_headers():
+    # чтобы проверки здоровья не кэшировались где-нибудь по пути
+    return {"Cache-Control": "no-store, max-age=0"}
+
+
 def verify_hmac(raw_body: bytes, ts: str, sig: str):
     _need_env("HMAC_SECRET", HMAC_SECRET)
+
     if not ts or not sig:
         raise HTTPException(401, "Missing signature headers")
 
@@ -36,24 +45,35 @@ def verify_hmac(raw_body: bytes, ts: str, sig: str):
     if not hmac.compare_digest(expected, sig):
         raise HTTPException(401, "Bad signature")
 
+
 @app.get("/")
 def root():
-    return {
-        "ok": True,
-        "routes": {
-            "health": "GET /healthz",
-            "rewrite": "POST /rewrite (HMAC required)",
-            "rewrite_alias": "POST / (HMAC required)"
-        }
-    }
+    return JSONResponse(
+        {
+            "ok": True,
+            "routes": {
+                "health": "GET /healthz (and /health, /_health, /ping)",
+                "rewrite": "POST /rewrite (HMAC required)",
+                "rewrite_alias": "POST / (HMAC required)",
+            },
+        },
+        headers=_no_store_headers(),
+    )
 
+
+# Несколько health-эндпоинтов: выбирайте любой в админке
 @app.get("/healthz")
-def healthz():
-    return {"ok": True}
+@app.get("/health")
+@app.get("/_health")
+@app.get("/ping")
+def health():
+    return JSONResponse({"ok": True}, headers=_no_store_headers())
+
 
 def build_prompt(payload: dict) -> str:
-    # Keep the prompt strict: no hallucinations, JSON-only.
-    return f"""Ты — редактор новостей. Переформулируй материал нейтрально. НЕЛЬЗЯ добавлять факты, которых нет в исходном тексте.
+    return f"""\
+Ты — редактор новостей. Переформулируй материал нейтрально.
+НЕЛЬЗЯ добавлять факты, которых нет в исходном тексте.
 НЕЛЬЗЯ копировать исходник длинными кусками. Нужен полный перефраз.
 Выводи ТОЛЬКО валидный JSON без Markdown и без комментариев.
 
@@ -95,13 +115,17 @@ region_hint: {payload.get("region_hint","")}
 - В content сделай 3–6 абзацев (paragraph). Список (list) — только если уместно.
 """.strip()
 
+
 async def call_gemini(prompt: str) -> dict:
     _need_env("GEMINI_API_KEY", GEMINI_API_KEY)
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1800}
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1800},
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -117,6 +141,7 @@ async def call_gemini(prompt: str) -> dict:
         except Exception:
             raise HTTPException(502, "Model returned non-JSON")
 
+
 @app.post("/rewrite")
 async def rewrite(req: Request):
     raw = await req.body()
@@ -128,9 +153,11 @@ async def rewrite(req: Request):
 
     if not isinstance(out, dict) or out.get("ok") is not True:
         raise HTTPException(502, "Bad output format")
-    return out
 
-# Alias: if something calls POST /
+    return JSONResponse(out)
+
+
+# Алиас: если кто-то бьёт POST /
 @app.post("/")
 async def rewrite_alias(req: Request):
     return await rewrite(req)
