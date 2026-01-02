@@ -5,7 +5,7 @@ import hmac
 import hashlib
 import re
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -83,7 +83,9 @@ class RewriteRequest(BaseModel):
 
 class ContentBlock(BaseModel):
     type: str
-    value: str
+    value: Optional[str] = None
+    items: Optional[List[str]] = None
+    author: Optional[str] = None
 
 class RewriteResponse(BaseModel):
     title: str
@@ -129,7 +131,9 @@ def build_prompt(payload: RewriteRequest) -> str:
   "heroImage": "...",
   "content": [
     {{"type":"paragraph","value":"..."}},
-    {{"type":"paragraph","value":"..."}}
+    {{"type":"heading","value":"..."}},
+    {{"type":"list","items":["...","..."]}},
+    {{"type":"quote","value":"...","author":"..."}}
   ]
 }}
 
@@ -161,40 +165,15 @@ def _parse_json_strict_or_fallback(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 2) извлекаем сбалансированный JSON-объект {...}
+    # 2) извлекаем JSON между первой "{" и последней "}"
     obj_start = s.find("{")
-    if obj_start != -1:
-        in_string = False
-        escape = False
-        depth = 0
-        last_valid = None
-        for idx in range(obj_start, len(s)):
-            ch = s[idx]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-                continue
-
-            if ch == '"':
-                in_string = True
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                if depth > 0:
-                    depth -= 1
-                    if depth == 0:
-                        last_valid = s[obj_start:idx + 1].strip()
-
-        if last_valid:
-            try:
-                return json.loads(last_valid)
-            except Exception:
-                pass
+    obj_end = s.rfind("}")
+    if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+        candidate = s[obj_start:obj_end + 1].strip()
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
 
     raw = s[:RESPONSE_MODEL_RAW_LIMIT]
     logger.error("Model returned non-JSON: %s", s[:LOG_MODEL_RAW_LIMIT])
@@ -233,8 +212,10 @@ async def call_gemini(prompt: str) -> Dict[str, Any]:
                         "properties": {
                             "type": {"type": "string"},
                             "value": {"type": "string"},
+                            "items": {"type": "array", "items": {"type": "string"}},
+                            "author": {"type": "string"},
                         },
-                        "required": ["type", "value"],
+                        "required": ["type"],
                     },
                 },
             },
@@ -332,6 +313,48 @@ async def call_gemini(prompt: str) -> Dict[str, Any]:
 
     return parsed
 
+def _clean_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\r", " ").replace("\n", " ").strip()
+
+def _normalize_category(value: str) -> str:
+    allowed = {"city", "transport", "incidents", "sports", "events", "real-estate", "other"}
+    if value in allowed:
+        return value
+    return "other"
+
+def _convert_legacy_format(data: Dict[str, Any], payload: RewriteRequest) -> Dict[str, Any]:
+    if not data.get("content") and (data.get("summary") or data.get("text")):
+        excerpt = _clean_str(data.get("summary", ""))
+        raw_text = data.get("text", "")
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", str(raw_text)) if p.strip()]
+        content = [{"type": "paragraph", "value": _clean_str(p)} for p in paragraphs]
+        data["excerpt"] = excerpt
+        data["content"] = content
+        if not data.get("heroImage"):
+            data["heroImage"] = payload.source_image or ""
+    return data
+
+def _normalize_content_block(item: Dict[str, Any]) -> Optional[ContentBlock]:
+    block_type = _clean_str(item.get("type"))
+    if not block_type:
+        return None
+
+    if block_type == "list":
+        raw_items = item.get("items") or []
+        items = [_clean_str(v) for v in raw_items if _clean_str(v)]
+        return ContentBlock(type=block_type, items=items)
+
+    if block_type == "quote":
+        return ContentBlock(
+            type=block_type,
+            value=_clean_str(item.get("value")),
+            author=_clean_str(item.get("author")),
+        )
+
+    return ContentBlock(type=block_type, value=_clean_str(item.get("value")))
+
 # ---- Middleware: keep raw body for signature ----
 @app.middleware("http")
 async def capture_raw_body(request: Request, call_next):
@@ -346,22 +369,31 @@ def root():
 def healthz():
     return {"ok": True}
 
+@app.get("/healthz/healthz")
+def healthz_alias():
+    return {"ok": True}
+
 @app.post("/rewrite", response_model=RewriteResponse)
 async def rewrite(payload: RewriteRequest, req: Request, _=Depends(verify_hmac)):
     prompt = build_prompt(payload)
     out = await call_gemini(prompt)
+    out = _convert_legacy_format(out, payload)
 
     # Подстраховка: если модель вернула лишние ключи — игнорируем.
     return RewriteResponse(
-        title=str(out.get("title", "")).strip(),
-        category=str(out.get("category", "other")).strip() or "other",
-        excerpt=str(out.get("excerpt", "")).strip(),
-        tags=[str(t).strip() for t in (out.get("tags") or []) if str(t).strip()],
-        heroImage=str(out.get("heroImage", "")).strip(),
+        title=_clean_str(out.get("title")),
+        category=_normalize_category(_clean_str(out.get("category", "other"))),
+        excerpt=_clean_str(out.get("excerpt")),
+        tags=[_clean_str(t) for t in (out.get("tags") or []) if _clean_str(t)],
+        heroImage=_clean_str(out.get("heroImage") or payload.source_image or ""),
         content=[
-            ContentBlock(type=str(item.get("type", "")).strip(), value=str(item.get("value", "")).strip())
-            for item in (out.get("content") or [])
-            if isinstance(item, dict)
+            block
+            for block in (
+                _normalize_content_block(item)
+                for item in (out.get("content") or [])
+                if isinstance(item, dict)
+            )
+            if block is not None
         ],
     )
 
