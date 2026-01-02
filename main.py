@@ -25,7 +25,7 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_ENDPOINT = os.environ.get("GEMINI_ENDPOINT", "https://generativelanguage.googleapis.com/v1beta")
 
 LOG_GEMINI_ERROR_BODY_LIMIT = 1000
-LOG_MODEL_RAW_LIMIT = 2000
+LOG_MODEL_RAW_LIMIT = 1000
 RESPONSE_MODEL_RAW_LIMIT = 2000
 
 class ServiceError(Exception):
@@ -139,20 +139,40 @@ def _parse_json_strict_or_fallback(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 2) вытащить максимально крупный JSON-объект {...}
-    candidate = s
-    for _ in range(5):
-        obj_start = candidate.find("{")
-        obj_end = candidate.rfind("}")
-        if obj_start == -1 or obj_end == -1 or obj_end <= obj_start:
-            break
-        sliced = candidate[obj_start:obj_end + 1].strip()
-        try:
-            return json.loads(sliced)
-        except Exception:
-            if sliced == candidate:
-                break
-            candidate = sliced
+    # 2) извлекаем сбалансированный JSON-объект {...}
+    obj_start = s.find("{")
+    if obj_start != -1:
+        in_string = False
+        escape = False
+        depth = 0
+        last_valid = None
+        for idx in range(obj_start, len(s)):
+            ch = s[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0:
+                        last_valid = s[obj_start:idx + 1].strip()
+
+        if last_valid:
+            try:
+                return json.loads(last_valid)
+            except Exception:
+                pass
 
     raw = s[:RESPONSE_MODEL_RAW_LIMIT]
     logger.error("Model returned non-JSON: %s", s[:LOG_MODEL_RAW_LIMIT])
@@ -165,9 +185,10 @@ async def call_gemini(prompt: str) -> Dict[str, Any]:
     # На всякий случай убираем лишний префикс, если кто-то вписал "models/..."
     model = model.replace("models/", "")
 
-    url = f"{GEMINI_ENDPOINT}/models/{model}:generateContent?key={api_key}"
+    endpoint_path = f"{GEMINI_ENDPOINT}/models/{model}:generateContent"
+    url = f"{endpoint_path}?key={api_key}"
     logger.info("Gemini model: %s", model)
-    logger.info("Gemini endpoint: %s", url)
+    logger.info("Gemini endpoint: %s", endpoint_path)
 
     # JSON Mode: просим JSON и задаём схему.
     # Даже если конкретная версия API проигнорирует эти поля, у нас есть строгий промт + запасной парсер.
@@ -197,12 +218,18 @@ async def call_gemini(prompt: str) -> Dict[str, Any]:
         "generationConfig": generation_config,
     }
 
+    timeout = httpx.Timeout(connect=10.0, read=90.0, write=90.0, pool=90.0)
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(url, json=body)
-    except httpx.HTTPError as exc:
-        logger.exception("HTTPX error calling Gemini: %s", exc)
-        raise ServiceError(status_code=502, detail=f"HTTPX error: {exc}")
+    except httpx.TimeoutException as exc:
+        logger.exception("Gemini timeout: %s", exc)
+        raise ServiceError(status_code=502, detail=f"Gemini timeout: {exc}")
+    except httpx.RequestError as exc:
+        logger.exception("Gemini request error: %s", exc)
+        raise ServiceError(status_code=502, detail=f"Gemini request error: {exc}")
+
+    logger.info("Gemini status: %s", r.status_code)
 
     if r.status_code >= 400:
         truncated = r.text[:LOG_GEMINI_ERROR_BODY_LIMIT]
@@ -210,21 +237,58 @@ async def call_gemini(prompt: str) -> Dict[str, Any]:
         raise ServiceError(
             status_code=502,
             detail=f"Gemini error: {r.status_code}: {truncated}",
+            raw=truncated,
         )
 
     try:
         data = r.json()
     except json.JSONDecodeError:
-        truncated = r.text[:LOG_GEMINI_ERROR_BODY_LIMIT]
-        logger.error("Gemini response was not JSON: %s", truncated)
-        raise ServiceError(status_code=502, detail="Unexpected Gemini response structure")
+        truncated = r.text[:RESPONSE_MODEL_RAW_LIMIT]
+        logger.error("Gemini response was not JSON: %s", truncated[:LOG_GEMINI_ERROR_BODY_LIMIT])
+        raise ServiceError(
+            status_code=502,
+            detail="Gemini returned non-JSON response",
+            raw=truncated,
+        )
 
     try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        parts = data["candidates"][0]["content"]["parts"]
     except Exception:
-        data_preview = json.dumps(data)[:LOG_GEMINI_ERROR_BODY_LIMIT]
-        logger.error("Unexpected Gemini response structure: %s", data_preview)
-        raise ServiceError(status_code=502, detail="Unexpected Gemini response structure")
+        data_preview = json.dumps(data)[:RESPONSE_MODEL_RAW_LIMIT]
+        logger.error("Unexpected Gemini response structure: %s", data_preview[:LOG_GEMINI_ERROR_BODY_LIMIT])
+        raise ServiceError(
+            status_code=502,
+            detail="Unexpected Gemini response structure",
+            raw=data_preview,
+        )
+
+    if not isinstance(parts, list):
+        data_preview = json.dumps(data)[:RESPONSE_MODEL_RAW_LIMIT]
+        logger.error("Unexpected Gemini response structure: %s", data_preview[:LOG_GEMINI_ERROR_BODY_LIMIT])
+        raise ServiceError(
+            status_code=502,
+            detail="Unexpected Gemini response structure",
+            raw=data_preview,
+        )
+
+    text_chunks = []
+    for part in parts:
+        if isinstance(part, dict):
+            text_value = part.get("text")
+            if isinstance(text_value, str) and text_value.strip():
+                text_chunks.append(text_value)
+
+    if not text_chunks:
+        data_preview = json.dumps(data)[:RESPONSE_MODEL_RAW_LIMIT]
+        logger.error("Unexpected Gemini response structure: %s", data_preview[:LOG_GEMINI_ERROR_BODY_LIMIT])
+        raise ServiceError(
+            status_code=502,
+            detail="Unexpected Gemini response structure",
+            raw=data_preview,
+        )
+
+    text = "\n".join(text_chunks)
+    logger.info("Gemini response text length: %s", len(text))
 
     parsed = _parse_json_strict_or_fallback(text)
 

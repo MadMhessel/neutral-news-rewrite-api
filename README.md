@@ -8,6 +8,8 @@
 - GEMINI_MODEL — модель (по умолчанию gemini-2.5-flash)
 - GEMINI_ENDPOINT — (необязательно) https://generativelanguage.googleapis.com/v1beta
 
+⚠️ Важно: никогда не логируйте ключи API. Если ключ уже попал в логи — его нужно перевыпустить.
+
 ## Эндпойнты
 - GET / — проверка, список маршрутов
 - GET /healthz — health-check
