@@ -81,13 +81,17 @@ class RewriteRequest(BaseModel):
     source_image: Optional[str] = Field(default="")
     region_hint: Optional[str] = Field(default="")
 
+class ContentBlock(BaseModel):
+    type: str
+    value: str
+
 class RewriteResponse(BaseModel):
     title: str
-    text: str
-    summary: str
-    tags: list[str]
     category: str
-    image_prompt: str
+    excerpt: str
+    tags: list[str]
+    heroImage: str
+    content: list[ContentBlock]
 
 # ---- Prompt ----
 def build_prompt(payload: RewriteRequest) -> str:
@@ -97,31 +101,36 @@ def build_prompt(payload: RewriteRequest) -> str:
 ЖЁСТКИЕ ПРАВИЛА:
 - Не добавляй новых фактов, версий и деталей.
 - Все числа, даты, имена собственные, адреса и названия организаций сохраняй БЕЗ ИЗМЕНЕНИЙ.
-- Если заголовок содержит число, оно должно быть с единицей измерения, не оставляй голое число в конце.
-- Если фактов мало — пиши коротко и нейтрально, без домыслов и воды.
-- Стиль: информационный, без оценок, без эмоций, без обращений к читателю, без канцелярита.
-- Игнорируй технический мусор: ссылки внутри текста, повторяющиеся фрагменты, длинные служебные строки и временные метки в виде "2025-12-31T...".
-- Внутри значений JSON не используй декоративные кавычки («…», “…”).
+- Если фактов мало — пиши коротко и нейтрально, без «воды».
+- Стиль: информационный, без оценок, без эмоций, без обращений к читателю.
 
 ФОРМАТ ВЫВОДА:
-Верни ТОЛЬКО один валидный JSON-объект без Markdown и пояснений.
+Верни ТОЛЬКО один валидный JSON-объект. Без Markdown, без пояснений.
 Ответ должен начинаться с {{ и заканчиваться }}.
+В строковых полях НЕ используй символы перевода строки. Абзацы делай только через массив content (блоки).
 
 ОГРАНИЧЕНИЯ:
 - title: до 110 символов
-- summary: 260–520 символов
-- text: 700–1700 символов (НЕ БОЛЬШЕ 1700), 3–5 абзацев, абзацы через \\n\\n, 1-й абзац — лид (1–2 предложения)
-- tags: 5–8 (короткие, без #, нижний регистр)
-- image_prompt: 250–450 символов
+- excerpt: 250–600 символов (1–3 предложения)
+- content: 3–6 блоков
+  - 1-й блок paragraph — лид (1–2 предложения)
+  - затем 2–5 блоков paragraph с деталями
+  - при необходимости добавь 1 блок list (2–6 пунктов) ИЛИ 1 блок quote (только если цитата реально есть в исходнике)
+- tags: 5–10, короткие, без #, нижний регистр
+- category: выбери ОДНО из: city, transport, incidents, sports, events, real-estate (если совсем не подходит — other)
+- heroImage: если в исходнике есть ссылка на изображение — поставь её, иначе пустая строка
 
 Верни JSON строго по схеме:
 {{
   "title": "...",
-  "summary": "...",
-  "text": "...",
-  "category": "city|incidents|politics|economy|society|sports|culture|tech|realty|other",
-  "tags": ["..."],
-  "image_prompt": "..."
+  "excerpt": "...",
+  "category": "city|transport|incidents|sports|events|real-estate|other",
+  "tags": ["...", "..."],
+  "heroImage": "...",
+  "content": [
+    {{"type":"paragraph","value":"..."}},
+    {{"type":"paragraph","value":"..."}}
+  ]
 }}
 
 ИСХОДНЫЕ ДАННЫЕ:
@@ -130,6 +139,7 @@ def build_prompt(payload: RewriteRequest) -> str:
 Ссылка: {payload.source_url}
 Сайт: {payload.source_site}
 Дата/время публикации: {payload.source_published_at}
+Изображение: {payload.source_image}
 Регион: {payload.region_hint}
 """
 
@@ -212,13 +222,23 @@ async def call_gemini(prompt: str) -> Dict[str, Any]:
             "type": "object",
             "properties": {
                 "title": {"type": "string"},
-                "text": {"type": "string"},
-                "summary": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
                 "category": {"type": "string"},
-                "image_prompt": {"type": "string"},
+                "excerpt": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "heroImage": {"type": "string"},
+                "content": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string"},
+                            "value": {"type": "string"},
+                        },
+                        "required": ["type", "value"],
+                    },
+                },
             },
-            "required": ["title", "text", "summary", "tags", "category", "image_prompt"],
+            "required": ["title", "excerpt", "category", "tags", "heroImage", "content"],
         },
     }
 
@@ -307,6 +327,8 @@ async def call_gemini(prompt: str) -> Dict[str, Any]:
     # Нормализация типов
     if not isinstance(parsed.get("tags", []), list):
         parsed["tags"] = []
+    if not isinstance(parsed.get("content", []), list):
+        parsed["content"] = []
 
     return parsed
 
@@ -332,11 +354,15 @@ async def rewrite(payload: RewriteRequest, req: Request, _=Depends(verify_hmac))
     # Подстраховка: если модель вернула лишние ключи — игнорируем.
     return RewriteResponse(
         title=str(out.get("title", "")).strip(),
-        text=str(out.get("text", "")).strip(),
-        summary=str(out.get("summary", "")).strip(),
+        category=str(out.get("category", "other")).strip() or "other",
+        excerpt=str(out.get("excerpt", "")).strip(),
         tags=[str(t).strip() for t in (out.get("tags") or []) if str(t).strip()],
-        category=str(out.get("category", "Другое")).strip() or "Другое",
-        image_prompt=str(out.get("image_prompt", "")).strip(),
+        heroImage=str(out.get("heroImage", "")).strip(),
+        content=[
+            ContentBlock(type=str(item.get("type", "")).strip(), value=str(item.get("value", "")).strip())
+            for item in (out.get("content") or [])
+            if isinstance(item, dict)
+        ],
     )
 
 # Алиас: POST /
