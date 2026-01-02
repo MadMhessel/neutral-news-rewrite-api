@@ -4,11 +4,16 @@ import time
 import hmac
 import hashlib
 import re
+import logging
 from typing import Optional, Dict, Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("neutral-news-rewrite-api")
 
 app = FastAPI(title="Neutral News Rewrite API")
 
@@ -18,6 +23,23 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("API_KEY") o
 HMAC_SECRET = os.environ.get("HMAC_SECRET", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_ENDPOINT = os.environ.get("GEMINI_ENDPOINT", "https://generativelanguage.googleapis.com/v1beta")
+
+LOG_GEMINI_ERROR_BODY_LIMIT = 1000
+LOG_MODEL_RAW_LIMIT = 2000
+RESPONSE_MODEL_RAW_LIMIT = 2000
+
+class ServiceError(Exception):
+    def __init__(self, status_code: int, detail: str, raw: Optional[str] = None) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        self.raw = raw
+
+@app.exception_handler(ServiceError)
+async def service_error_handler(request: Request, exc: ServiceError):
+    payload = {"detail": exc.detail}
+    if exc.raw is not None:
+        payload["raw"] = exc.raw
+    return JSONResponse(status_code=exc.status_code, content=payload)
 
 def _need_env(name: str, val: str) -> str:
     if not val:
@@ -80,6 +102,7 @@ def build_prompt(payload: RewriteRequest) -> str:
 4) Не меняй смысл. Исправляй стиль, структуру, ясность.
 5) Не вставляй ссылки, если их нет в исходных данных.
 6) Верни результат СТРОГО в виде JSON-объекта без лишнего текста, без Markdown, без ```.
+7) Ответ должен начинаться с символа {{ и заканчиваться }}.
 
 Входные данные:
 Заголовок: {payload.source_title}
@@ -116,25 +139,24 @@ def _parse_json_strict_or_fallback(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 2) вытащить первый объект {...} или массив [...]
-    obj_start = s.find("{")
-    obj_end = s.rfind("}")
-    arr_start = s.find("[")
-    arr_end = s.rfind("]")
-
-    candidates = []
-    if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
-        candidates.append(s[obj_start:obj_end+1])
-    if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
-        candidates.append(s[arr_start:arr_end+1])
-
-    for c in candidates:
+    # 2) вытащить максимально крупный JSON-объект {...}
+    candidate = s
+    for _ in range(5):
+        obj_start = candidate.find("{")
+        obj_end = candidate.rfind("}")
+        if obj_start == -1 or obj_end == -1 or obj_end <= obj_start:
+            break
+        sliced = candidate[obj_start:obj_end + 1].strip()
         try:
-            return json.loads(c)
+            return json.loads(sliced)
         except Exception:
-            continue
+            if sliced == candidate:
+                break
+            candidate = sliced
 
-    raise HTTPException(status_code=502, detail="Model returned non-JSON")
+    raw = s[:RESPONSE_MODEL_RAW_LIMIT]
+    logger.error("Model returned non-JSON: %s", s[:LOG_MODEL_RAW_LIMIT])
+    raise ServiceError(status_code=502, detail="Model returned non-JSON", raw=raw)
 
 # ---- Gemini call ----
 async def call_gemini(prompt: str) -> Dict[str, Any]:
@@ -144,6 +166,8 @@ async def call_gemini(prompt: str) -> Dict[str, Any]:
     model = model.replace("models/", "")
 
     url = f"{GEMINI_ENDPOINT}/models/{model}:generateContent?key={api_key}"
+    logger.info("Gemini model: %s", model)
+    logger.info("Gemini endpoint: %s", url)
 
     # JSON Mode: просим JSON и задаём схему.
     # Даже если конкретная версия API проигнорирует эти поля, у нас есть строгий промт + запасной парсер.
@@ -166,23 +190,43 @@ async def call_gemini(prompt: str) -> Dict[str, Any]:
     }
 
     body = {
+        "systemInstruction": {
+            "parts": [{"text": "Верни строго JSON, без Markdown, без пояснений. Начинай с { и заканчивай }."}]
+        },
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": generation_config,
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, json=body)
-        # Ошибки модели/ключа — отдаём явно.
-        if r.status_code >= 400:
-            raise HTTPException(status_code=502, detail=f"Gemini error: {r.status_code}: {r.text[:500]}")
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            r = await client.post(url, json=body)
+    except httpx.HTTPError as exc:
+        logger.exception("HTTPX error calling Gemini: %s", exc)
+        raise ServiceError(status_code=502, detail=f"HTTPX error: {exc}")
 
+    if r.status_code >= 400:
+        truncated = r.text[:LOG_GEMINI_ERROR_BODY_LIMIT]
+        logger.error("Gemini error %s: %s", r.status_code, truncated)
+        raise ServiceError(
+            status_code=502,
+            detail=f"Gemini error: {r.status_code}: {truncated}",
+        )
+
+    try:
         data = r.json()
-        try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
-            raise HTTPException(status_code=502, detail="Unexpected Gemini response structure")
+    except json.JSONDecodeError:
+        truncated = r.text[:LOG_GEMINI_ERROR_BODY_LIMIT]
+        logger.error("Gemini response was not JSON: %s", truncated)
+        raise ServiceError(status_code=502, detail="Unexpected Gemini response structure")
 
-        parsed = _parse_json_strict_or_fallback(text)
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        data_preview = json.dumps(data)[:LOG_GEMINI_ERROR_BODY_LIMIT]
+        logger.error("Unexpected Gemini response structure: %s", data_preview)
+        raise ServiceError(status_code=502, detail="Unexpected Gemini response structure")
+
+    parsed = _parse_json_strict_or_fallback(text)
 
     # Нормализация типов
     if not isinstance(parsed.get("tags", []), list):
