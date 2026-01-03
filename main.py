@@ -86,6 +86,8 @@ class ContentBlock(BaseModel):
     value: Optional[str] = None
     items: Optional[List[str]] = None
     author: Optional[str] = None
+    kind: Optional[str] = None
+    title: Optional[str] = None
 
 class RewriteResponse(BaseModel):
     title: str
@@ -94,6 +96,8 @@ class RewriteResponse(BaseModel):
     tags: list[str]
     heroImage: str
     content: list[ContentBlock]
+    flags: list[str]
+    confidence: float
 
 # ---- Prompt ----
 def build_prompt(payload: RewriteRequest) -> str:
@@ -113,28 +117,38 @@ def build_prompt(payload: RewriteRequest) -> str:
 
 ОГРАНИЧЕНИЯ:
 - title: до 110 символов
-- excerpt: 250–600 символов (1–3 предложения)
-- content: 3–6 блоков
+- excerpt: до 240 символов (1–2 предложения, отвечает на «что произошло?»)
+- content: минимум 3 блока
   - 1-й блок paragraph — лид (1–2 предложения)
-  - затем 2–5 блоков paragraph с деталями
-  - при необходимости добавь 1 блок list (2–6 пунктов) ИЛИ 1 блок quote (только если цитата реально есть в исходнике)
-- tags: 5–10, короткие, без #, нижний регистр
-- category: выбери ОДНО из: city, transport, incidents, sports, events, real-estate (если совсем не подходит — other)
+  - затем 1–4 блока paragraph с деталями
+  - при необходимости добавь 1 блок list (2–6 пунктов)
+  - heading для подзаголовков
+  - quote только если цитата реально есть в исходнике
+  - divider допустим как разделитель
+  - callout допустим при необходимости (kind: info|warning|important)
+- tags: 3–7, короткие, без #, нижний регистр
+- category: используй slug категории сайта (пример: city, transport, incidents, russia-world). Если сомневаешься — city
 - heroImage: если в исходнике есть ссылка на изображение — поставь её, иначе пустая строка
+- flags: если есть редакционные метки — перечисли, иначе []
+- confidence: число от 0.0 до 1.0 — уверенность в корректности фактов
 
 Верни JSON строго по схеме:
 {{
   "title": "...",
   "excerpt": "...",
-  "category": "city|transport|incidents|sports|events|real-estate|other",
+  "category": "slug",
   "tags": ["...", "..."],
   "heroImage": "...",
   "content": [
     {{"type":"paragraph","value":"..."}},
     {{"type":"heading","value":"..."}},
     {{"type":"list","items":["...","..."]}},
-    {{"type":"quote","value":"...","author":"..."}}
-  ]
+    {{"type":"quote","value":"...","author":"..."}},
+    {{"type":"callout","kind":"info","title":"...","value":"..."}},
+    {{"type":"divider"}}
+  ],
+  "flags": ["..."],
+  "confidence": 0.0
 }}
 
 ИСХОДНЫЕ ДАННЫЕ:
@@ -214,12 +228,25 @@ async def call_gemini(prompt: str) -> Dict[str, Any]:
                             "value": {"type": "string"},
                             "items": {"type": "array", "items": {"type": "string"}},
                             "author": {"type": "string"},
+                            "kind": {"type": "string"},
+                            "title": {"type": "string"},
                         },
                         "required": ["type"],
                     },
                 },
+                "flags": {"type": "array", "items": {"type": "string"}},
+                "confidence": {"type": "number"},
             },
-            "required": ["title", "excerpt", "category", "tags", "heroImage", "content"],
+            "required": [
+                "title",
+                "excerpt",
+                "category",
+                "tags",
+                "heroImage",
+                "content",
+                "flags",
+                "confidence",
+            ],
         },
     }
 
@@ -319,10 +346,17 @@ def _clean_str(value: Any) -> str:
     return str(value).replace("\r", " ").replace("\n", " ").strip()
 
 def _normalize_category(value: str) -> str:
-    allowed = {"city", "transport", "incidents", "sports", "events", "real-estate", "other"}
-    if value in allowed:
-        return value
-    return "other"
+    normalized = _clean_str(value)
+    if normalized and re.fullmatch(r"[a-z0-9-]+", normalized):
+        return normalized
+    return "city"
+
+def _normalize_confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(max(confidence, 0.0), 1.0)
 
 def _convert_legacy_format(data: Dict[str, Any], payload: RewriteRequest) -> Dict[str, Any]:
     if not data.get("content") and (data.get("summary") or data.get("text")):
@@ -353,6 +387,17 @@ def _normalize_content_block(item: Dict[str, Any]) -> Optional[ContentBlock]:
             author=_clean_str(item.get("author")),
         )
 
+    if block_type == "callout":
+        return ContentBlock(
+            type=block_type,
+            kind=_clean_str(item.get("kind")),
+            title=_clean_str(item.get("title")),
+            value=_clean_str(item.get("value")),
+        )
+
+    if block_type == "divider":
+        return ContentBlock(type=block_type)
+
     return ContentBlock(type=block_type, value=_clean_str(item.get("value")))
 
 # ---- Middleware: keep raw body for signature ----
@@ -382,7 +427,7 @@ async def rewrite(payload: RewriteRequest, req: Request, _=Depends(verify_hmac))
     # Подстраховка: если модель вернула лишние ключи — игнорируем.
     return RewriteResponse(
         title=_clean_str(out.get("title")),
-        category=_normalize_category(_clean_str(out.get("category", "other"))),
+        category=_normalize_category(out.get("category", "city")),
         excerpt=_clean_str(out.get("excerpt")),
         tags=[_clean_str(t) for t in (out.get("tags") or []) if _clean_str(t)],
         heroImage=_clean_str(out.get("heroImage") or payload.source_image or ""),
@@ -395,6 +440,8 @@ async def rewrite(payload: RewriteRequest, req: Request, _=Depends(verify_hmac))
             )
             if block is not None
         ],
+        flags=[_clean_str(flag) for flag in (out.get("flags") or []) if _clean_str(flag)],
+        confidence=_normalize_confidence(out.get("confidence")),
     )
 
 # Алиас: POST /
