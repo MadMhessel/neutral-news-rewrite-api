@@ -75,55 +75,34 @@ class ContentBlock(BaseModel):
     kind: Optional[str] = None
     title: Optional[str] = None
 
-class FocalPoint(BaseModel):
-    x: Optional[float] = None
-    y: Optional[float] = None
-
-class AuthorInfo(BaseModel):
-    name: Optional[str] = None
-    role: Optional[str] = None
-
-class SourceInfo(BaseModel):
-    name: Optional[str] = None
-    url: Optional[str] = None
-
-class LocationInfo(BaseModel):
-    city: Optional[str] = None
-    district: Optional[str] = None
-    address: Optional[str] = None
-
 class RewriteResponse(BaseModel):
-    title: Optional[str] = None
-    excerpt: Optional[str] = None
-    category: Optional[str] = None
-    tags: Optional[list[str]] = None
-    content: Optional[list[ContentBlock]] = None
-    heroImage: Optional[str] = None
-    heroImageSquare: Optional[str] = None
-    heroImageAuthor: Optional[str] = None
-    heroFocalX: Optional[float] = None
-    heroFocalY: Optional[float] = None
-    heroFocal: Optional[FocalPoint] = None
-    status: Optional[str] = None
-    scheduledAt: Optional[str] = None
-    slug: Optional[str] = None
-    authorName: Optional[str] = None
-    authorRole: Optional[str] = None
-    sourceName: Optional[str] = None
-    sourceUrl: Optional[str] = None
-    author: Optional[AuthorInfo] = None
-    source: Optional[SourceInfo] = None
-    locationCity: Optional[str] = None
-    locationDistrict: Optional[str] = None
-    locationAddress: Optional[str] = None
-    location: Optional[LocationInfo] = None
-    isVerified: Optional[bool] = None
-    isFeatured: Optional[bool] = None
-    isBreaking: Optional[bool] = None
-    pinnedNowReading: Optional[bool] = None
-    pinnedNowReadingRank: Optional[int] = None
-    flags: Optional[list[str]] = None
-    confidence: Optional[float] = None
+    title: str
+    excerpt: str
+    category: str
+    tags: list[str]
+    content: list[ContentBlock]
+    heroImage: str
+    heroImageSquare: str
+    heroImageAuthor: str
+    heroFocalX: float
+    heroFocalY: float
+    status: str
+    scheduledAt: str
+    slug: str
+    authorName: str
+    authorRole: str
+    sourceName: str
+    sourceUrl: str
+    locationCity: str
+    locationDistrict: str
+    locationAddress: str
+    isVerified: bool
+    isFeatured: bool
+    isBreaking: bool
+    pinnedNowReading: bool
+    pinnedNowReadingRank: int
+    flags: list[str]
+    confidence: float
 
 
 class RSSImage(BaseModel):
@@ -188,65 +167,62 @@ def build_prompt(payload: RewriteRequest) -> str:
 - Все числа, даты, имена собственные, адреса и названия организаций сохраняй БЕЗ ИЗМЕНЕНИЙ.
 - Если фактов мало — пиши коротко и нейтрально, без «воды».
 - Стиль: информационный, без оценок, без эмоций, без обращений к читателю.
+- Возвращай ТОЛЬКО плоские поля (никаких вложенных объектов author/source/location).
 
 ФОРМАТ ВЫВОДА:
 Верни ТОЛЬКО один валидный JSON-объект. Без Markdown, без пояснений.
 Ответ должен начинаться с {{ и заканчиваться }}.
 В строковых полях НЕ используй символы перевода строки. Абзацы делай только через массив content (блоки).
 
-ПРАВИЛА ФОРМАТА:
-- Все поля опциональны. Если поле не задано — просто не включай его в JSON.
-- title: до 110 символов
-- excerpt: до 240 символов (1–2 предложения, отвечает на «что произошло?»)
-- content: желательно 3+ блока
-  - 1-й блок paragraph — лид (1–2 предложения)
-  - затем 1–4 блока paragraph с деталями
-  - при необходимости добавь 1 блок list (2–6 пунктов)
-  - heading для подзаголовков
-  - quote только если цитата реально есть в исходнике
-  - divider допустим как разделитель
-  - callout допустим при необходимости (kind: info|warning|important)
-- tags: 3–7, короткие, без #, нижний регистр
-- category: используй slug категории сайта (пример: city, transport, incidents, russia-world). Если сомневаешься — city
-- heroImage: если в исходнике есть ссылка на изображение — поставь её
-- flags: если есть редакционные метки — перечисли
-- confidence: число от 0.0 до 1.0 — уверенность в корректности фактов
+ПРАВИЛА ФОРМАТА (ВСЕ ПОЛЯ ОБЯЗАТЕЛЬНЫ):
+- title: 6–14 слов, без кликбейта.
+- excerpt: 1–2 предложения, без новых фактов.
+- category: slug категории сайта (пример: city, transport, incidents, russia-world). Если сомневаешься — city.
+- tags: 3–8 коротких тегов, только ключевые темы.
+- content: 2–3 абзаца, только type=paragraph. Структура: лид → детали → контекст.
+- heroImage/heroImageSquare: если есть изображение в исходнике — укажи ссылку, иначе пустая строка.
+- status: всегда "draft".
+- scheduledAt: пустая строка.
+- slug: латиницей, из title.
+- authorName/authorRole: если нет данных — пустая строка.
+- sourceName/sourceUrl: если нет данных — пустая строка.
+- locationCity/locationDistrict/locationAddress: только если указаны в тексте, иначе пустая строка.
+- isVerified/isFeatured/isBreaking/pinnedNowReading: по умолчанию false.
+- pinnedNowReadingRank: 0.
+- flags: пустой массив, если нет меток.
+- confidence: 0.7–0.9.
 
-Поддерживаемые поля:
+СТРОГО ФИКСИРОВАННАЯ СТРУКТУРА JSON (ВСЕ КЛЮЧИ ОБЯЗАТЕЛЬНЫ):
 {{
   "title": "...",
   "excerpt": "...",
-  "category": "slug",
-  "tags": ["...", "..."],
-  "heroImage": "...",
-  "heroImageSquare": "...",
-  "heroImageAuthor": "...",
-  "heroFocalX": 0.5,
-  "heroFocalY": 0.3,
-  "heroFocal": {{"x": 0.5, "y": 0.3}},
-  "status": "draft",
-  "scheduledAt": "2024-01-01T12:00:00Z",
+  "category": "city",
+  "tags": ["..."],
   "slug": "...",
   "authorName": "...",
   "authorRole": "...",
   "sourceName": "...",
   "sourceUrl": "...",
-  "author": {{"name":"...","role":"..."}},
-  "source": {{"name":"...","url":"..."}},
   "locationCity": "...",
   "locationDistrict": "...",
   "locationAddress": "...",
-  "location": {{"city":"...","district":"...","address":"..."}},
-  "isVerified": true,
+  "heroImage": "...",
+  "heroImageSquare": "...",
+  "heroImageAuthor": "...",
+  "heroFocalX": 0.5,
+  "heroFocalY": 0.5,
+  "status": "draft",
+  "scheduledAt": "",
+  "isVerified": false,
   "isFeatured": false,
   "isBreaking": false,
-  "pinnedNowReading": true,
-  "pinnedNowReadingRank": 1,
+  "pinnedNowReading": false,
+  "pinnedNowReadingRank": 0,
+  "flags": [],
+  "confidence": 0.85,
   "content": [
     {{"type":"paragraph","value":"..."}}
-  ],
-  "flags": ["..."],
-  "confidence": 0.0
+  ]
 }}
 
 ИСХОДНЫЕ ДАННЫЕ:
@@ -275,10 +251,6 @@ def build_rewrite_response_schema() -> Dict[str, Any]:
                     "properties": {
                         "type": {"type": "string"},
                         "value": {"type": "string"},
-                        "items": {"type": "array", "items": {"type": "string"}},
-                        "author": {"type": "string"},
-                        "kind": {"type": "string"},
-                        "title": {"type": "string"},
                     },
                     "required": ["type"],
                 },
@@ -288,10 +260,6 @@ def build_rewrite_response_schema() -> Dict[str, Any]:
             "heroImageAuthor": {"type": "string"},
             "heroFocalX": {"type": "number"},
             "heroFocalY": {"type": "number"},
-            "heroFocal": {
-                "type": "object",
-                "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
-            },
             "status": {"type": "string"},
             "scheduledAt": {"type": "string"},
             "slug": {"type": "string"},
@@ -299,25 +267,9 @@ def build_rewrite_response_schema() -> Dict[str, Any]:
             "authorRole": {"type": "string"},
             "sourceName": {"type": "string"},
             "sourceUrl": {"type": "string"},
-            "author": {
-                "type": "object",
-                "properties": {"name": {"type": "string"}, "role": {"type": "string"}},
-            },
-            "source": {
-                "type": "object",
-                "properties": {"name": {"type": "string"}, "url": {"type": "string"}},
-            },
             "locationCity": {"type": "string"},
             "locationDistrict": {"type": "string"},
             "locationAddress": {"type": "string"},
-            "location": {
-                "type": "object",
-                "properties": {
-                    "city": {"type": "string"},
-                    "district": {"type": "string"},
-                    "address": {"type": "string"},
-                },
-            },
             "isVerified": {"type": "boolean"},
             "isFeatured": {"type": "boolean"},
             "isBreaking": {"type": "boolean"},
@@ -326,6 +278,35 @@ def build_rewrite_response_schema() -> Dict[str, Any]:
             "flags": {"type": "array", "items": {"type": "string"}},
             "confidence": {"type": "number"},
         },
+        "required": [
+            "title",
+            "excerpt",
+            "category",
+            "tags",
+            "content",
+            "heroImage",
+            "heroImageSquare",
+            "heroImageAuthor",
+            "heroFocalX",
+            "heroFocalY",
+            "status",
+            "scheduledAt",
+            "slug",
+            "authorName",
+            "authorRole",
+            "sourceName",
+            "sourceUrl",
+            "locationCity",
+            "locationDistrict",
+            "locationAddress",
+            "isVerified",
+            "isFeatured",
+            "isBreaking",
+            "pinnedNowReading",
+            "pinnedNowReadingRank",
+            "flags",
+            "confidence",
+        ],
     }
 
 
@@ -427,7 +408,7 @@ def _clean_optional_str(value: Any) -> Optional[str]:
 def _normalize_category(value: Any) -> Optional[str]:
     normalized = _clean_str(value)
     if not normalized:
-        return None
+        return "city"
     if normalized and re.fullmatch(r"[a-z0-9-]+", normalized):
         return normalized
     return "city"
@@ -473,42 +454,10 @@ def _normalize_str_list(value: Any) -> Optional[list[str]]:
         return None
     return [_clean_str(item) for item in value if _clean_str(item)]
 
-def _normalize_focal_point(value: Any) -> Optional[FocalPoint]:
-    if not isinstance(value, dict):
-        return None
-    x = _normalize_optional_float(value.get("x"))
-    y = _normalize_optional_float(value.get("y"))
-    if x is None and y is None:
-        return None
-    return FocalPoint(x=x, y=y)
-
-def _normalize_author_info(value: Any) -> Optional[AuthorInfo]:
-    if not isinstance(value, dict):
-        return None
-    name = _clean_optional_str(value.get("name"))
-    role = _clean_optional_str(value.get("role"))
-    if not name and not role:
-        return None
-    return AuthorInfo(name=name, role=role)
-
-def _normalize_source_info(value: Any) -> Optional[SourceInfo]:
-    if not isinstance(value, dict):
-        return None
-    name = _clean_optional_str(value.get("name"))
-    url = _clean_optional_str(value.get("url"))
-    if not name and not url:
-        return None
-    return SourceInfo(name=name, url=url)
-
-def _normalize_location_info(value: Any) -> Optional[LocationInfo]:
-    if not isinstance(value, dict):
-        return None
-    city = _clean_optional_str(value.get("city"))
-    district = _clean_optional_str(value.get("district"))
-    address = _clean_optional_str(value.get("address"))
-    if not city and not district and not address:
-        return None
-    return LocationInfo(city=city, district=district, address=address)
+def _slugify(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "-", value.lower())
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    return normalized
 
 
 def _normalize_rss_image(value: Optional[RSSImage]) -> Dict[str, str]:
@@ -583,35 +532,83 @@ def _convert_legacy_format(data: Dict[str, Any], payload: RewriteRequest) -> Dic
             data["heroImage"] = payload.source_image or ""
     return data
 
-def _normalize_content_block(item: Dict[str, Any]) -> Optional[ContentBlock]:
-    block_type = _clean_str(item.get("type"))
-    if not block_type:
-        return None
+def _split_sentences(text: str) -> List[str]:
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [s.strip() for s in sentences if s.strip()]
 
-    if block_type == "list":
-        raw_items = item.get("items") or []
-        items = [_clean_str(v) for v in raw_items if _clean_str(v)]
-        return ContentBlock(type=block_type, items=items)
 
-    if block_type == "quote":
-        return ContentBlock(
-            type=block_type,
-            value=_clean_str(item.get("value")),
-            author=_clean_str(item.get("author")),
-        )
+def _build_paragraphs_from_text(text: str) -> List[str]:
+    raw_paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+    if len(raw_paragraphs) >= 2:
+        return raw_paragraphs
+    sentences = _split_sentences(text)
+    if len(sentences) >= 2:
+        return sentences
+    if text.strip():
+        midpoint = max(1, len(text) // 2)
+        return [text[:midpoint].strip(), text[midpoint:].strip()] if text[midpoint:].strip() else [text.strip()]
+    return []
 
-    if block_type == "callout":
-        return ContentBlock(
-            type=block_type,
-            kind=_clean_str(item.get("kind")),
-            title=_clean_str(item.get("title")),
-            value=_clean_str(item.get("value")),
-        )
 
-    if block_type == "divider":
-        return ContentBlock(type=block_type)
+def _normalize_content_blocks(out: Dict[str, Any], payload: RewriteRequest) -> List[ContentBlock]:
+    blocks: List[ContentBlock] = []
+    raw_content = out.get("content") if isinstance(out.get("content"), list) else []
+    for item in raw_content:
+        if not isinstance(item, dict):
+            continue
+        value = item.get("value")
+        if value is None and isinstance(item.get("items"), list):
+            value = "; ".join(str(v) for v in item.get("items") if _clean_str(v))
+        cleaned_value = _clean_str(value)
+        if cleaned_value:
+            blocks.append(ContentBlock(type="paragraph", value=cleaned_value))
 
-    return ContentBlock(type=block_type, value=_clean_str(item.get("value")))
+    if blocks:
+        return blocks
+
+    source_text = _clean_str(payload.source_text) or _clean_str(payload.source_title)
+    paragraphs = _build_paragraphs_from_text(source_text)
+    return [ContentBlock(type="paragraph", value=_clean_str(p)) for p in paragraphs if _clean_str(p)]
+
+
+def _ensure_min_paragraphs(blocks: List[ContentBlock], fallback_text: str) -> List[ContentBlock]:
+    if len(blocks) >= 2:
+        return blocks
+    paragraphs = _build_paragraphs_from_text(fallback_text)
+    for paragraph in paragraphs:
+        if len(blocks) >= 2:
+            break
+        if paragraph and all(block.value != paragraph for block in blocks):
+            blocks.append(ContentBlock(type="paragraph", value=_clean_str(paragraph)))
+    return blocks if blocks else [ContentBlock(type="paragraph", value=_clean_str(fallback_text))]
+
+
+def _derive_excerpt(text: str) -> str:
+    sentences = _split_sentences(text)
+    if not sentences:
+        return ""
+    return _clean_str(" ".join(sentences[:2]))
+
+
+def _derive_title(text: str) -> str:
+    words = [w for w in re.split(r"\s+", text) if w]
+    if not words:
+        return ""
+    return _clean_str(" ".join(words[:14]))
+
+
+def _normalize_tags(out: Dict[str, Any], payload: RewriteRequest) -> List[str]:
+    tags = _normalize_str_list(out.get("tags")) or []
+    text = " ".join([_clean_str(payload.source_title), _clean_str(payload.source_text)])
+    supplemental = _extract_keywords(text, limit=8)
+    for tag in supplemental:
+        if tag not in tags:
+            tags.append(tag)
+        if len(tags) >= 8:
+            break
+    while len(tags) < 3:
+        tags.append("новости")
+    return tags[:8]
 
 # ---- Middleware: keep raw body for signature ----
 @app.middleware("http")
@@ -639,72 +636,117 @@ def healthz():
 def healthz_alias():
     return {"ok": True}
 
-@app.post("/rewrite", response_model=RewriteResponse, response_model_exclude_none=True)
+@app.post("/rewrite", response_model=RewriteResponse)
 async def rewrite(payload: RewriteRequest, req: Request, _=Depends(verify_hmac)):
     prompt = build_prompt(payload)
     out = await call_gemini(prompt, build_rewrite_response_schema())
     out = _convert_legacy_format(out, payload)
 
-    if not isinstance(out.get("tags", []), list):
+    if not isinstance(out.get("tags"), list):
         out["tags"] = []
-    if not isinstance(out.get("content", []), list):
+    if not isinstance(out.get("content"), list):
         out["content"] = []
 
-    response: Dict[str, Any] = {}
+    source_text = _clean_str(payload.source_text)
+    fallback_text = source_text or _clean_str(payload.source_title)
 
-    response["title"] = _clean_optional_str(out.get("title"))
-    response["excerpt"] = _clean_optional_str(out.get("excerpt"))
-    response["category"] = _normalize_category(out.get("category"))
+    title = _clean_str(out.get("title")) or _clean_str(payload.source_title) or _derive_title(fallback_text)
+    if title:
+        title = _clean_str(title)
+    else:
+        title = "Новости региона"
+    if not fallback_text:
+        fallback_text = title
 
-    if "tags" in out:
-        response["tags"] = _normalize_str_list(out.get("tags"))
+    excerpt = _clean_str(out.get("excerpt")) or _derive_excerpt(fallback_text)
+    if not excerpt and source_text:
+        excerpt = _derive_excerpt(source_text)
 
-    if "content" in out and isinstance(out.get("content"), list):
-        response["content"] = [
-            block
-            for block in (
-                _normalize_content_block(item)
-                for item in (out.get("content") or [])
-                if isinstance(item, dict)
-            )
-            if block is not None
-        ]
+    content_blocks = _normalize_content_blocks(out, payload)
+    content_blocks = _ensure_min_paragraphs(content_blocks, fallback_text)
 
-    response["heroImage"] = _clean_optional_str(out.get("heroImage"))
-    response["heroImageSquare"] = _clean_optional_str(out.get("heroImageSquare"))
-    response["heroImageAuthor"] = _clean_optional_str(out.get("heroImageAuthor"))
-    response["heroFocalX"] = _normalize_optional_float(out.get("heroFocalX"))
-    response["heroFocalY"] = _normalize_optional_float(out.get("heroFocalY"))
-    response["heroFocal"] = _normalize_focal_point(out.get("heroFocal"))
-    response["status"] = _clean_optional_str(out.get("status"))
-    response["scheduledAt"] = _clean_optional_str(out.get("scheduledAt"))
-    response["slug"] = _clean_optional_str(out.get("slug"))
-    response["authorName"] = _clean_optional_str(out.get("authorName"))
-    response["authorRole"] = _clean_optional_str(out.get("authorRole"))
-    response["sourceName"] = _clean_optional_str(out.get("sourceName"))
-    response["sourceUrl"] = _clean_optional_str(out.get("sourceUrl"))
-    response["author"] = _normalize_author_info(out.get("author"))
-    response["source"] = _normalize_source_info(out.get("source"))
-    response["locationCity"] = _clean_optional_str(out.get("locationCity"))
-    response["locationDistrict"] = _clean_optional_str(out.get("locationDistrict"))
-    response["locationAddress"] = _clean_optional_str(out.get("locationAddress"))
-    response["location"] = _normalize_location_info(out.get("location"))
-    response["isVerified"] = _normalize_optional_bool(out.get("isVerified"))
-    response["isFeatured"] = _normalize_optional_bool(out.get("isFeatured"))
-    response["isBreaking"] = _normalize_optional_bool(out.get("isBreaking"))
-    response["pinnedNowReading"] = _normalize_optional_bool(out.get("pinnedNowReading"))
-    response["pinnedNowReadingRank"] = _normalize_optional_int(out.get("pinnedNowReadingRank"))
+    category = _normalize_category(out.get("category"))
+    tags = _normalize_tags(out, payload)[:8]
 
-    if "flags" in out:
-        response["flags"] = _normalize_str_list(out.get("flags"))
+    hero_image = _clean_str(out.get("heroImage")) or _clean_str(payload.source_image)
+    hero_image_square = _clean_str(out.get("heroImageSquare")) or hero_image
+    hero_image_author = _clean_str(out.get("heroImageAuthor"))
 
-    response["confidence"] = _normalize_confidence(out.get("confidence"))
+    hero_focal_x = _normalize_optional_float(out.get("heroFocalX"))
+    hero_focal_y = _normalize_optional_float(out.get("heroFocalY"))
+    hero_focal_x = 0.5 if hero_focal_x is None else hero_focal_x
+    hero_focal_y = 0.5 if hero_focal_y is None else hero_focal_y
 
-    cleaned = {key: value for key, value in response.items() if value is not None}
-    return RewriteResponse(**cleaned)
+    author = out.get("author") if isinstance(out.get("author"), dict) else {}
+    author_name = _clean_str(out.get("authorName")) or _clean_str(author.get("name"))
+    author_role = _clean_str(out.get("authorRole")) or _clean_str(author.get("role"))
+
+    source = out.get("source") if isinstance(out.get("source"), dict) else {}
+    source_name = _clean_str(out.get("sourceName")) or _clean_str(source.get("name")) or _clean_str(payload.source_site)
+    source_url = _clean_str(out.get("sourceUrl")) or _clean_str(source.get("url")) or _clean_str(payload.source_url)
+
+    location = out.get("location") if isinstance(out.get("location"), dict) else {}
+    location_city = _clean_str(out.get("locationCity")) or _clean_str(location.get("city"))
+    location_district = _clean_str(out.get("locationDistrict")) or _clean_str(location.get("district"))
+    location_address = _clean_str(out.get("locationAddress")) or _clean_str(location.get("address"))
+
+    is_verified = _normalize_optional_bool(out.get("isVerified"))
+    is_featured = _normalize_optional_bool(out.get("isFeatured"))
+    is_breaking = _normalize_optional_bool(out.get("isBreaking"))
+    pinned_now_reading = _normalize_optional_bool(out.get("pinnedNowReading"))
+    pinned_now_reading_rank = _normalize_optional_int(out.get("pinnedNowReadingRank"))
+
+    flags = _normalize_str_list(out.get("flags")) or []
+    confidence = _normalize_confidence(out.get("confidence"))
+    if confidence is None:
+        confidence = 0.85
+
+    response: Dict[str, Any] = {
+        "title": title,
+        "excerpt": excerpt,
+        "category": category,
+        "tags": tags,
+        "content": content_blocks,
+        "heroImage": hero_image,
+        "heroImageSquare": hero_image_square,
+        "heroImageAuthor": hero_image_author,
+        "heroFocalX": hero_focal_x,
+        "heroFocalY": hero_focal_y,
+        "status": "draft",
+        "scheduledAt": "",
+        "slug": _clean_str(out.get("slug")) or _slugify(title),
+        "authorName": author_name,
+        "authorRole": author_role,
+        "sourceName": source_name,
+        "sourceUrl": source_url,
+        "locationCity": location_city,
+        "locationDistrict": location_district,
+        "locationAddress": location_address,
+        "isVerified": bool(is_verified) if is_verified is not None else False,
+        "isFeatured": bool(is_featured) if is_featured is not None else False,
+        "isBreaking": bool(is_breaking) if is_breaking is not None else False,
+        "pinnedNowReading": bool(pinned_now_reading) if pinned_now_reading is not None else False,
+        "pinnedNowReadingRank": pinned_now_reading_rank if pinned_now_reading_rank is not None else 0,
+        "flags": flags,
+        "confidence": confidence,
+    }
+
+    response["excerpt"] = response["excerpt"] or _derive_excerpt(
+        content_blocks[0].value if content_blocks else fallback_text
+    )
+    if not response["excerpt"]:
+        response["excerpt"] = response["title"]
+
+    if not response["tags"]:
+        response["tags"] = ["новости"]
+
+    if not response["content"]:
+        response["content"] = [ContentBlock(type="paragraph", value=_clean_str(fallback_text))]
+
+    return RewriteResponse(**response)
 
 # Алиас: POST /
-@app.post("/", response_model=RewriteResponse, response_model_exclude_none=True)
+@app.post("/", response_model=RewriteResponse)
 async def rewrite_alias(payload: RewriteRequest, req: Request, _=Depends(verify_hmac)):
     return await rewrite(payload, req)
 
