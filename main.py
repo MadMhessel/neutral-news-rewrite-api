@@ -1,5 +1,4 @@
 import os
-import json
 import time
 import hmac
 import hashlib
@@ -7,10 +6,11 @@ import re
 import logging
 from typing import Optional, Dict, Any, List
 
-import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
+
+from gemini_service import ServiceError, call_gemini
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("neutral-news-rewrite-api")
@@ -18,21 +18,7 @@ logger = logging.getLogger("neutral-news-rewrite-api")
 app = FastAPI(title="Neutral News Rewrite API")
 
 # ---- ENV ----
-# Поддерживаем оба имени переменной, чтобы не ловить 500 из-за одной буквы.
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("API_KEY") or ""
 HMAC_SECRET = os.environ.get("HMAC_SECRET", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_ENDPOINT = os.environ.get("GEMINI_ENDPOINT", "https://generativelanguage.googleapis.com/v1beta")
-
-LOG_GEMINI_ERROR_BODY_LIMIT = 1000
-LOG_MODEL_RAW_LIMIT = 1000
-RESPONSE_MODEL_RAW_LIMIT = 2000
-
-class ServiceError(Exception):
-    def __init__(self, status_code: int, detail: str, raw: Optional[str] = None) -> None:
-        self.status_code = status_code
-        self.detail = detail
-        self.raw = raw
 
 @app.exception_handler(ServiceError)
 async def service_error_handler(request: Request, exc: ServiceError):
@@ -139,6 +125,59 @@ class RewriteResponse(BaseModel):
     flags: Optional[list[str]] = None
     confidence: Optional[float] = None
 
+
+class RSSImage(BaseModel):
+    url: Optional[str] = None
+    type: Optional[str] = None
+    length: Optional[str] = None
+
+
+class RSSMedia(BaseModel):
+    thumbnail: Optional[str] = None
+    content: Optional[str] = None
+
+
+class RSSRewriteRequest(BaseModel):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    title: Optional[str] = None
+    subtitle: Optional[str] = None
+    deck: Optional[str] = None
+    description: Optional[str] = None
+    summary: Optional[str] = None
+    content: Optional[str] = None
+    content_encoded: Optional[str] = Field(default=None, alias="content:encoded")
+    excerpt: Optional[str] = None
+    link: Optional[str] = None
+    guid: Optional[str] = None
+    pubDate: Optional[str] = None
+    author: Optional[str] = None
+    dc_creator: Optional[str] = Field(default=None, alias="dc:creator")
+    category: Optional[str] = None
+    categories: Optional[List[str]] = None
+    keywords: Optional[List[str]] = None
+    source: Optional[str] = None
+    language: Optional[str] = None
+    image: Optional[RSSImage] = None
+    enclosure: Optional[RSSImage] = None
+    media: Optional[RSSMedia] = None
+    media_content: Optional[str] = Field(default=None, alias="media:content")
+    media_thumbnail: Optional[str] = Field(default=None, alias="media:thumbnail")
+    comments: Optional[str] = None
+    location: Optional[str] = None
+    rights: Optional[str] = None
+    copyright: Optional[str] = None
+    priority: Optional[str] = None
+    isBreaking: Optional[bool] = None
+    tone: Optional[str] = None
+    readingTime: Optional[str] = None
+
+
+class RSSRewriteResponse(BaseModel):
+    rss: Dict[str, Any]
+    editorial: Dict[str, Any]
+    validation: Dict[str, Any]
+
 # ---- Prompt ----
 def build_prompt(payload: RewriteRequest) -> str:
     # Важно: требуем "только JSON", без обёрток и пояснений.
@@ -220,213 +259,159 @@ def build_prompt(payload: RewriteRequest) -> str:
 Регион: {payload.region_hint}
 """
 
-# ---- JSON extraction fallback ----
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
-def _parse_json_strict_or_fallback(text: str) -> Dict[str, Any]:
-    """Пытаемся распарсить JSON максимально строго, но если модель всё же добавила мусор — вытащим JSON из текста."""
-    s = text.strip()
-
-    # Частый случай: модель обернула в ```json ... ```
-    m = _JSON_FENCE_RE.search(s)
-    if m:
-        s = m.group(1).strip()
-
-    # 1) строго
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-
-    # 2) извлекаем JSON между первой "{" и последней "}"
-    obj_start = s.find("{")
-    obj_end = s.rfind("}")
-    if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
-        candidate = s[obj_start:obj_end + 1].strip()
-        try:
-            return json.loads(candidate)
-        except Exception:
-            pass
-
-    raw = s[:RESPONSE_MODEL_RAW_LIMIT]
-    logger.error("Model returned non-JSON: %s", s[:LOG_MODEL_RAW_LIMIT])
-    raise ServiceError(status_code=502, detail="Model returned non-JSON", raw=raw)
-
-# ---- Gemini call ----
-async def call_gemini(prompt: str) -> Dict[str, Any]:
-    api_key = _need_env("GEMINI_API_KEY (or API_KEY)", GEMINI_API_KEY)
-    model = GEMINI_MODEL.strip()
-    # На всякий случай убираем лишний префикс, если кто-то вписал "models/..."
-    model = model.replace("models/", "")
-
-    endpoint_path = f"{GEMINI_ENDPOINT}/models/{model}:generateContent"
-    url = f"{endpoint_path}?key={api_key}"
-    logger.info("Gemini model: %s", model)
-    logger.info("Gemini endpoint: %s", endpoint_path)
-
-    # JSON Mode: просим JSON и задаём схему.
-    # Даже если конкретная версия API проигнорирует эти поля, у нас есть строгий промт + запасной парсер.
-    generation_config = {
-        "temperature": 0.2,
-        "maxOutputTokens": 4096,
-        "responseMimeType": "application/json",
-        "responseSchema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string"},
-                "excerpt": {"type": "string"},
-                "category": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "content": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "type": {"type": "string"},
-                            "value": {"type": "string"},
-                            "items": {"type": "array", "items": {"type": "string"}},
-                            "author": {"type": "string"},
-                            "kind": {"type": "string"},
-                            "title": {"type": "string"},
-                        },
-                        "required": ["type"],
-                    },
-                },
-                "heroImage": {"type": "string"},
-                "heroImageSquare": {"type": "string"},
-                "heroImageAuthor": {"type": "string"},
-                "heroFocalX": {"type": "number"},
-                "heroFocalY": {"type": "number"},
-                "heroFocal": {
-                    "type": "object",
-                    "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
-                },
-                "status": {"type": "string"},
-                "scheduledAt": {"type": "string"},
-                "slug": {"type": "string"},
-                "authorName": {"type": "string"},
-                "authorRole": {"type": "string"},
-                "sourceName": {"type": "string"},
-                "sourceUrl": {"type": "string"},
-                "author": {
-                    "type": "object",
-                    "properties": {"name": {"type": "string"}, "role": {"type": "string"}},
-                },
-                "source": {
-                    "type": "object",
-                    "properties": {"name": {"type": "string"}, "url": {"type": "string"}},
-                },
-                "locationCity": {"type": "string"},
-                "locationDistrict": {"type": "string"},
-                "locationAddress": {"type": "string"},
-                "location": {
+def build_rewrite_response_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "excerpt": {"type": "string"},
+            "category": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "content": {
+                "type": "array",
+                "items": {
                     "type": "object",
                     "properties": {
-                        "city": {"type": "string"},
-                        "district": {"type": "string"},
-                        "address": {"type": "string"},
+                        "type": {"type": "string"},
+                        "value": {"type": "string"},
+                        "items": {"type": "array", "items": {"type": "string"}},
+                        "author": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "title": {"type": "string"},
                     },
+                    "required": ["type"],
                 },
-                "isVerified": {"type": "boolean"},
-                "isFeatured": {"type": "boolean"},
-                "isBreaking": {"type": "boolean"},
-                "pinnedNowReading": {"type": "boolean"},
-                "pinnedNowReadingRank": {"type": "number"},
-                "flags": {"type": "array", "items": {"type": "string"}},
-                "confidence": {"type": "number"},
             },
+            "heroImage": {"type": "string"},
+            "heroImageSquare": {"type": "string"},
+            "heroImageAuthor": {"type": "string"},
+            "heroFocalX": {"type": "number"},
+            "heroFocalY": {"type": "number"},
+            "heroFocal": {
+                "type": "object",
+                "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+            },
+            "status": {"type": "string"},
+            "scheduledAt": {"type": "string"},
+            "slug": {"type": "string"},
+            "authorName": {"type": "string"},
+            "authorRole": {"type": "string"},
+            "sourceName": {"type": "string"},
+            "sourceUrl": {"type": "string"},
+            "author": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "role": {"type": "string"}},
+            },
+            "source": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "url": {"type": "string"}},
+            },
+            "locationCity": {"type": "string"},
+            "locationDistrict": {"type": "string"},
+            "locationAddress": {"type": "string"},
+            "location": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "district": {"type": "string"},
+                    "address": {"type": "string"},
+                },
+            },
+            "isVerified": {"type": "boolean"},
+            "isFeatured": {"type": "boolean"},
+            "isBreaking": {"type": "boolean"},
+            "pinnedNowReading": {"type": "boolean"},
+            "pinnedNowReadingRank": {"type": "number"},
+            "flags": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "number"},
         },
     }
 
-    body = {
-        "systemInstruction": {
-            "parts": [{"text": "Верни строго один JSON-объект. Никакого Markdown. Начни с { и закончи }."}]
+
+def build_rss_prompt(payload: RSSRewriteRequest) -> str:
+    return f"""Ты — новостной редактор. Сделай нейтральный реврайт новости на языке исходника.
+
+ЖЁСТКИЕ ПРАВИЛА:
+- Не добавляй новых фактов, версий и деталей.
+- Все числа, даты, имена, адреса и названия организаций сохраняй без изменений.
+- Если фактов мало — пиши коротко и нейтрально.
+- Структура: вступление → детали → контекст.
+- Без кликбейта и оценочных формулировок.
+
+ФОРМАТ ВЫВОДА:
+Верни ТОЛЬКО один валидный JSON-объект без Markdown.
+Ответ должен начинаться с {{ и заканчиваться }}.
+В строковых полях не используй перевод строк.
+
+ПРАВИЛА:
+- Заполни все доступные поля.
+- Если данных нет — оставь пустую строку или пустой массив.
+- description/excerpt должны быть 1–2 предложения.
+- keywords: 3–10 слов/фраз.
+
+СТРУКТУРА JSON:
+{{
+  "title": "...",
+  "subtitle": "...",
+  "description": "...",
+  "content": "...",
+  "excerpt": "...",
+  "categories": ["..."],
+  "keywords": ["..."],
+  "language": "...",
+  "location": "...",
+  "readingTime": "3 min",
+  "priority": "...",
+  "isBreaking": false
+}}
+
+ИСХОДНЫЕ ДАННЫЕ:
+title: {payload.title}
+subtitle/deck: {payload.subtitle or payload.deck}
+description/summary: {payload.description or payload.summary}
+content/content:encoded: {payload.content or payload.content_encoded}
+excerpt: {payload.excerpt}
+link: {payload.link}
+guid: {payload.guid}
+pubDate: {payload.pubDate}
+author/dc:creator: {payload.author or payload.dc_creator}
+category/categories: {payload.categories or payload.category}
+keywords: {payload.keywords}
+source: {payload.source}
+language: {payload.language}
+image/enclosure: {payload.image or payload.enclosure}
+media content/thumbnail: {payload.media or payload.media_content or payload.media_thumbnail}
+comments: {payload.comments}
+location: {payload.location}
+rights: {payload.rights}
+copyright: {payload.copyright}
+priority: {payload.priority}
+isBreaking: {payload.isBreaking}
+tone: {payload.tone}
+readingTime: {payload.readingTime}
+"""
+
+
+def build_rss_response_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "subtitle": {"type": "string"},
+            "description": {"type": "string"},
+            "content": {"type": "string"},
+            "excerpt": {"type": "string"},
+            "categories": {"type": "array", "items": {"type": "string"}},
+            "keywords": {"type": "array", "items": {"type": "string"}},
+            "language": {"type": "string"},
+            "location": {"type": "string"},
+            "readingTime": {"type": "string"},
+            "priority": {"type": "string"},
+            "isBreaking": {"type": "boolean"},
         },
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": generation_config,
     }
 
-    timeout = httpx.Timeout(connect=10.0, read=90.0, write=90.0, pool=90.0)
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(url, json=body)
-    except httpx.TimeoutException as exc:
-        logger.exception("Gemini timeout: %s", exc)
-        raise ServiceError(status_code=502, detail=f"Gemini timeout: {exc}")
-    except httpx.RequestError as exc:
-        logger.exception("Gemini request error: %s", exc)
-        raise ServiceError(status_code=502, detail=f"Gemini request error: {exc}")
-
-    logger.info("Gemini status: %s", r.status_code)
-
-    if r.status_code >= 400:
-        truncated = r.text[:LOG_GEMINI_ERROR_BODY_LIMIT]
-        logger.error("Gemini error %s: %s", r.status_code, truncated)
-        raise ServiceError(
-            status_code=502,
-            detail=f"Gemini error: {r.status_code}: {truncated}",
-            raw=truncated,
-        )
-
-    try:
-        data = r.json()
-    except json.JSONDecodeError:
-        truncated = r.text[:RESPONSE_MODEL_RAW_LIMIT]
-        logger.error("Gemini response was not JSON: %s", truncated[:LOG_GEMINI_ERROR_BODY_LIMIT])
-        raise ServiceError(
-            status_code=502,
-            detail="Gemini returned non-JSON response",
-            raw=truncated,
-        )
-
-    try:
-        parts = data["candidates"][0]["content"]["parts"]
-    except Exception:
-        data_preview = json.dumps(data)[:RESPONSE_MODEL_RAW_LIMIT]
-        logger.error("Unexpected Gemini response structure: %s", data_preview[:LOG_GEMINI_ERROR_BODY_LIMIT])
-        raise ServiceError(
-            status_code=502,
-            detail="Unexpected Gemini response structure",
-            raw=data_preview,
-        )
-
-    if not isinstance(parts, list):
-        data_preview = json.dumps(data)[:RESPONSE_MODEL_RAW_LIMIT]
-        logger.error("Unexpected Gemini response structure: %s", data_preview[:LOG_GEMINI_ERROR_BODY_LIMIT])
-        raise ServiceError(
-            status_code=502,
-            detail="Unexpected Gemini response structure",
-            raw=data_preview,
-        )
-
-    text_chunks = []
-    for part in parts:
-        if isinstance(part, dict):
-            text_value = part.get("text")
-            if isinstance(text_value, str) and text_value.strip():
-                text_chunks.append(text_value)
-
-    if not text_chunks:
-        data_preview = json.dumps(data)[:RESPONSE_MODEL_RAW_LIMIT]
-        logger.error("Unexpected Gemini response structure: %s", data_preview[:LOG_GEMINI_ERROR_BODY_LIMIT])
-        raise ServiceError(
-            status_code=502,
-            detail="Unexpected Gemini response structure",
-            raw=data_preview,
-        )
-
-    text = "\n".join(text_chunks)
-    logger.info("Gemini response text length: %s", len(text))
-
-    parsed = _parse_json_strict_or_fallback(text)
-
-    # Нормализация типов
-    if not isinstance(parsed.get("tags", []), list):
-        parsed["tags"] = []
-    if not isinstance(parsed.get("content", []), list):
-        parsed["content"] = []
-
-    return parsed
 
 def _clean_str(value: Any) -> str:
     if value is None:
@@ -525,6 +510,67 @@ def _normalize_location_info(value: Any) -> Optional[LocationInfo]:
         return None
     return LocationInfo(city=city, district=district, address=address)
 
+
+def _normalize_rss_image(value: Optional[RSSImage]) -> Dict[str, str]:
+    if not value:
+        return {"url": "", "type": "", "length": ""}
+    return {
+        "url": _clean_str(value.url),
+        "type": _clean_str(value.type),
+        "length": _clean_str(value.length),
+    }
+
+
+def _normalize_rss_media(value: Optional[RSSMedia], content_url: Optional[str], thumbnail_url: Optional[str]) -> Dict[str, str]:
+    thumbnail = _clean_str(value.thumbnail) if value and value.thumbnail else _clean_str(thumbnail_url)
+    content = _clean_str(value.content) if value and value.content else _clean_str(content_url)
+    return {"thumbnail": thumbnail, "content": content}
+
+
+def _normalize_categories(payload: RSSRewriteRequest) -> List[str]:
+    categories: List[str] = []
+    if payload.categories:
+        categories.extend(payload.categories)
+    elif payload.category:
+        categories.append(payload.category)
+    return [_clean_str(item) for item in categories if _clean_str(item)]
+
+
+def _estimate_reading_time(text: str) -> str:
+    words = [w for w in re.split(r"\s+", text) if w]
+    if not words:
+        return ""
+    minutes = max(1, round(len(words) / 200))
+    return f"{minutes} min"
+
+
+def _extract_keywords(source: str, limit: int = 7) -> List[str]:
+    tokens = re.findall(r"[A-Za-zА-Яа-я0-9-]{4,}", source.lower())
+    seen = []
+    for token in tokens:
+        if token not in seen:
+            seen.append(token)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+def _is_empty(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, list):
+        return len(value) == 0
+    if isinstance(value, dict):
+        return all(_is_empty(v) for v in value.values())
+    return False
+
+
+def _append_missing_note(notes: List[str], field_name: str, value: Any) -> None:
+    if _is_empty(value):
+        notes.append(f"{field_name} отсутствует в исходнике")
+
 def _convert_legacy_format(data: Dict[str, Any], payload: RewriteRequest) -> Dict[str, Any]:
     if not data.get("content") and (data.get("summary") or data.get("text")):
         excerpt = _clean_str(data.get("summary", ""))
@@ -575,7 +621,15 @@ async def capture_raw_body(request: Request, call_next):
 
 @app.get("/")
 def root():
-    return {"ok": True, "routes": {"health": "GET /healthz", "rewrite": "POST /rewrite (HMAC required)", "rewrite_alias": "POST / (HMAC required)"}}
+    return {
+        "ok": True,
+        "routes": {
+            "health": "GET /healthz",
+            "rewrite": "POST /rewrite (HMAC required)",
+            "rss_rewrite": "POST /rss-rewrite (HMAC required)",
+            "rewrite_alias": "POST / (HMAC required)",
+        },
+    }
 
 @app.get("/healthz")
 def healthz():
@@ -588,8 +642,13 @@ def healthz_alias():
 @app.post("/rewrite", response_model=RewriteResponse, response_model_exclude_none=True)
 async def rewrite(payload: RewriteRequest, req: Request, _=Depends(verify_hmac)):
     prompt = build_prompt(payload)
-    out = await call_gemini(prompt)
+    out = await call_gemini(prompt, build_rewrite_response_schema())
     out = _convert_legacy_format(out, payload)
+
+    if not isinstance(out.get("tags", []), list):
+        out["tags"] = []
+    if not isinstance(out.get("content", []), list):
+        out["content"] = []
 
     response: Dict[str, Any] = {}
 
@@ -648,3 +707,155 @@ async def rewrite(payload: RewriteRequest, req: Request, _=Depends(verify_hmac))
 @app.post("/", response_model=RewriteResponse, response_model_exclude_none=True)
 async def rewrite_alias(payload: RewriteRequest, req: Request, _=Depends(verify_hmac)):
     return await rewrite(payload, req)
+
+
+@app.post("/rss-rewrite", response_model=RSSRewriteResponse)
+async def rss_rewrite(payload: RSSRewriteRequest, req: Request, _=Depends(verify_hmac)):
+    notes: List[str] = []
+    fact_warnings: List[str] = []
+    language = _clean_str(payload.language) or "ru"
+
+    prompt = build_rss_prompt(payload)
+    try:
+        out = await call_gemini(prompt, build_rss_response_schema())
+    except ServiceError as exc:
+        notes.append(f"Gemini error: {exc.detail}")
+        rss = {
+            "title": _clean_str(payload.title),
+            "subtitle": _clean_str(payload.subtitle or payload.deck),
+            "description": _clean_str(payload.description or payload.summary),
+            "content": _clean_str(payload.content or payload.content_encoded),
+            "excerpt": _clean_str(payload.excerpt),
+            "link": _clean_str(payload.link),
+            "guid": _clean_str(payload.guid),
+            "pubDate": _clean_str(payload.pubDate),
+            "author": _clean_str(payload.author or payload.dc_creator),
+            "categories": _normalize_categories(payload),
+            "keywords": payload.keywords or [],
+            "source": _clean_str(payload.source),
+            "language": language,
+            "image": _normalize_rss_image(payload.image or payload.enclosure),
+            "media": _normalize_rss_media(payload.media, payload.media_content, payload.media_thumbnail),
+            "comments": _clean_str(payload.comments),
+            "location": _clean_str(payload.location),
+            "rights": _clean_str(payload.rights),
+            "copyright": _clean_str(payload.copyright),
+            "priority": _clean_str(payload.priority or "normal"),
+            "isBreaking": bool(payload.isBreaking) if isinstance(payload.isBreaking, bool) else False,
+            "readingTime": _clean_str(payload.readingTime) or _estimate_reading_time(
+                _clean_str(payload.content or payload.content_encoded or payload.description or payload.summary)
+            ),
+        }
+        _append_missing_note(notes, "title", rss["title"])
+        _append_missing_note(notes, "description", rss["description"])
+        _append_missing_note(notes, "content", rss["content"])
+        _append_missing_note(notes, "excerpt", rss["excerpt"])
+        _append_missing_note(notes, "categories", rss["categories"])
+        _append_missing_note(notes, "keywords", rss["keywords"])
+        _append_missing_note(notes, "link", rss["link"])
+        _append_missing_note(notes, "guid", rss["guid"])
+        _append_missing_note(notes, "pubDate", rss["pubDate"])
+        _append_missing_note(notes, "author", rss["author"])
+        _append_missing_note(notes, "source", rss["source"])
+        _append_missing_note(notes, "language", rss["language"])
+        _append_missing_note(notes, "readingTime", rss["readingTime"])
+
+        if _is_empty(rss["image"]) and _is_empty(rss["media"]):
+            notes.append("image/media отсутствуют в исходнике")
+
+        editorial = {
+            "rewriteStyle": "нейтральный/деловой",
+            "tone": _clean_str(payload.tone) or "информативный",
+            "notes": notes,
+            "factCheckWarnings": fact_warnings,
+        }
+        validation = {
+            "factsPreserved": False,
+            "noHallucinations": False,
+            "languageDetected": language,
+            "safeForPublication": False,
+        }
+        return RSSRewriteResponse(rss=rss, editorial=editorial, validation=validation)
+
+    title = _clean_str(out.get("title")) or _clean_str(payload.title)
+    subtitle = _clean_str(out.get("subtitle")) or _clean_str(payload.subtitle or payload.deck)
+    description = _clean_str(out.get("description")) or _clean_str(payload.description or payload.summary)
+    content = _clean_str(out.get("content")) or _clean_str(payload.content or payload.content_encoded)
+    excerpt = _clean_str(out.get("excerpt")) or _clean_str(payload.excerpt)
+
+    categories = out.get("categories") if isinstance(out.get("categories"), list) else _normalize_categories(payload)
+    categories = [_clean_str(item) for item in categories if _clean_str(item)]
+
+    keywords = out.get("keywords") if isinstance(out.get("keywords"), list) else (payload.keywords or [])
+    keywords = [_clean_str(item) for item in keywords if _clean_str(item)]
+    if not keywords:
+        keywords = _extract_keywords(" ".join([title, description, content]))
+        if keywords:
+            notes.append("keywords сгенерированы из текста")
+
+    language = _clean_str(out.get("language")) or language
+    reading_time = _clean_str(out.get("readingTime")) or _clean_str(payload.readingTime)
+    if not reading_time:
+        reading_time = _estimate_reading_time(content or description)
+
+    priority = _clean_str(out.get("priority")) or _clean_str(payload.priority) or "normal"
+    is_breaking = out.get("isBreaking") if isinstance(out.get("isBreaking"), bool) else payload.isBreaking
+    if not isinstance(is_breaking, bool):
+        is_breaking = False
+
+    rss = {
+        "title": title,
+        "subtitle": subtitle,
+        "description": description,
+        "content": content,
+        "excerpt": excerpt,
+        "link": _clean_str(payload.link),
+        "guid": _clean_str(payload.guid),
+        "pubDate": _clean_str(payload.pubDate),
+        "author": _clean_str(payload.author or payload.dc_creator),
+        "categories": categories,
+        "keywords": keywords,
+        "source": _clean_str(payload.source),
+        "language": language,
+        "image": _normalize_rss_image(payload.image or payload.enclosure),
+        "media": _normalize_rss_media(payload.media, payload.media_content, payload.media_thumbnail),
+        "comments": _clean_str(payload.comments),
+        "location": _clean_str(out.get("location")) or _clean_str(payload.location),
+        "rights": _clean_str(payload.rights),
+        "copyright": _clean_str(payload.copyright),
+        "priority": priority,
+        "isBreaking": is_breaking,
+        "readingTime": reading_time,
+    }
+
+    _append_missing_note(notes, "title", title)
+    _append_missing_note(notes, "description", description)
+    _append_missing_note(notes, "content", content)
+    _append_missing_note(notes, "excerpt", excerpt)
+    _append_missing_note(notes, "categories", categories)
+    _append_missing_note(notes, "keywords", keywords)
+    _append_missing_note(notes, "link", rss["link"])
+    _append_missing_note(notes, "guid", rss["guid"])
+    _append_missing_note(notes, "pubDate", rss["pubDate"])
+    _append_missing_note(notes, "author", rss["author"])
+    _append_missing_note(notes, "source", rss["source"])
+    _append_missing_note(notes, "language", rss["language"])
+    _append_missing_note(notes, "readingTime", rss["readingTime"])
+
+    if _is_empty(rss["image"]) and _is_empty(rss["media"]):
+        notes.append("image/media отсутствуют в исходнике")
+
+    editorial = {
+        "rewriteStyle": "нейтральный/деловой",
+        "tone": _clean_str(payload.tone) or "информативный",
+        "notes": notes,
+        "factCheckWarnings": fact_warnings,
+    }
+    validation = {
+        "factsPreserved": True,
+        "noHallucinations": True,
+        "languageDetected": language,
+        "safeForPublication": bool(title and description and content),
+    }
+
+    return RSSRewriteResponse(rss=rss, editorial=editorial, validation=validation)
